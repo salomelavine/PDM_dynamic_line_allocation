@@ -30,14 +30,16 @@ def _to_dict(M: np.ndarray, rows: list, cols: list) -> dict:
             for i, r in enumerate(rows)}
 
 
-def build_connection_matrices(NODES, GENERATORS, LOADS, ZONES,
+def build_connection_matrices(NODES, GENERATORS, LOADS, ZONES, RENEWABLES,
                               connections_per_node, generators_per_node,
-                              loads_per_node, nodes_per_zone) -> dict:
+                              loads_per_node, nodes_per_zone,
+                              renewables_per_node) -> dict:
     """Adjacency / mapping / incidence matrices (NumPy arrays + line lists)."""
     n_idx = {n: i for i, n in enumerate(NODES)}
     g_idx = {g: i for i, g in enumerate(GENERATORS)}
     d_idx = {d: i for i, d in enumerate(LOADS)}
     z_idx = {z: i for i, z in enumerate(ZONES)}
+    r_idx = {r: i for i, r in enumerate(RENEWABLES)}
 
     # node x node adjacency
     A_nn = np.zeros((len(NODES), len(NODES)), dtype=int)
@@ -57,6 +59,12 @@ def build_connection_matrices(NODES, GENERATORS, LOADS, ZONES,
         for d in loads:
             M_nd[n_idx[n], d_idx[d]] = 1
 
+    # node x renewable
+    M_nr = np.zeros((len(NODES), len(RENEWABLES)), dtype=int)
+    for n, res in renewables_per_node.items():
+        for r in res:
+            M_nr[n_idx[n], r_idx[r]] = 1
+
     # zone x node
     M_zn = np.zeros((len(ZONES), len(NODES)), dtype=int)
     for z, nodes in nodes_per_zone.items():
@@ -66,6 +74,7 @@ def build_connection_matrices(NODES, GENERATORS, LOADS, ZONES,
     # zone-level mappings obtained by chaining
     M_zg = (M_zn @ M_ng > 0).astype(int)
     M_zd = (M_zn @ M_nd > 0).astype(int)
+    M_zr = (M_zn @ M_nr > 0).astype(int)
     A_zz = (M_zn @ A_nn @ M_zn.T > 0).astype(int)
     np.fill_diagonal(A_zz, 0)
 
@@ -89,8 +98,8 @@ def build_connection_matrices(NODES, GENERATORS, LOADS, ZONES,
         B_zl[z_idx[node_zone[n]], k] = 1
         B_zl[z_idx[node_zone[m]], k] = -1
 
-    return dict(A_nn=A_nn, M_ng=M_ng, M_nd=M_nd, M_zn=M_zn, M_zg=M_zg,
-                M_zd=M_zd, A_zz=A_zz, B_nl=B_nl, B_zl=B_zl,
+    return dict(A_nn=A_nn, M_ng=M_ng, M_nd=M_nd, M_nr=M_nr, M_zn=M_zn, M_zg=M_zg,
+                M_zd=M_zd, M_zr=M_zr, A_zz=A_zz, B_nl=B_nl, B_zl=B_zl,
                 lines=lines, intra_lines=intra_lines, inter_lines=inter_lines,
                 node_zone=node_zone)
 
@@ -150,6 +159,7 @@ class PowerSystemData:
     N_NODES: int = 4
     N_ZONES: int = 3
     N_SCENARIOS: int = 2
+    N_RES: int = 2
 
     # sets 
     GENERATORS: list | None = None
@@ -157,6 +167,7 @@ class PowerSystemData:
     NODES: list | None = None
     ZONES: list | None = None
     SCENARIOS: list | None = None
+    RENEWABLES: list | None = None 
 
     # general 
     S_BASE_MVA: float = 100.0
@@ -169,6 +180,7 @@ class PowerSystemData:
     connections_per_node: dict | None = None
     generators_per_node: dict | None = None
     loads_per_node: dict | None = None
+    renewables_per_node: dict | None = None
 
     # generators 
     gen_linear_cost_coeff: dict | None = None
@@ -183,6 +195,13 @@ class PowerSystemData:
     load_scenarios: dict | None = None
     scenario_probability: dict | None = None
     expected_DA_load: dict | None = None
+
+    # renewables
+    res_max_capacity: dict | None = None        # installed MW
+    res_cost_coeff: dict | None = None          # EUR/MWh produced (~0)
+    res_curtailment_cost: dict | None = None    # EUR/MWh available but not used
+    res_scenarios: dict | None = None           # {r: {s: available MW}}
+    expected_DA_res: dict | None = None         # DA forecast = expectation over scenarios
 
     # network parameters 
     intra_zone_capacity: float = 10.0          # line N1-N2
@@ -215,11 +234,14 @@ class PowerSystemData:
         self._default('NODES',      lambda: [f'N{i+1}' for i in range(self.N_NODES)])
         self._default('ZONES',      lambda: [f'Z{i+1}' for i in range(self.N_ZONES)])
         self._default('SCENARIOS',  lambda: [f'S{i+1}' for i in range(self.N_SCENARIOS)])
+        self._default('RENEWABLES', lambda: [f'R{i+1}' for i in range(self.N_RES)])
+
         self.indexes = dict(GENERATORS=self.GENERATORS, 
                             LOADS=self.LOADS,
                             NODES=self.NODES, 
                             ZONES=self.ZONES,
-                            SCENARIOS=self.SCENARIOS)
+                            SCENARIOS=self.SCENARIOS,
+                            RENEWABLES=self.RENEWABLES)
 
         self._default('V_BASE_KV', lambda: {n: 230.0 for n in self.NODES})
         self._default('slack_bus', lambda: self.NODES[0])
@@ -238,6 +260,9 @@ class PowerSystemData:
         })
         self._default('loads_per_node', lambda: {
             'N1': ['D1'], 'N2': ['D2'], 'N3': ['D3'], 'N4': ['D4'],
+        })
+        self._default('renewables_per_node', lambda: {
+            'N1': [], 'N2': ['R1'], 'N3': [], 'N4': ['R2'],
         })
 
         # generators: "cap @ cost ± deviation cost"
@@ -268,11 +293,26 @@ class PowerSystemData:
             for l in self.LOADS
         })
 
+        # renewables
+        self._default('res_max_capacity', lambda: {'R1': 15, 'R2': 10})
+        self._default('res_cost_coeff',   lambda: {'R1': 3, "R2": 4})
+        self._default('res_curtailment_cost', lambda: {r: 1 for r in self.RENEWABLES})
+        self._default('res_scenarios', lambda: {
+            'R1': {'S1': 12, 'S2': 4},
+            'R2': {'S1': 3,  'S2': 8},
+        })
+        self._default('expected_DA_res', lambda: {
+            r: sum(self.scenario_probability[s] * self.res_scenarios[r][s]
+                   for s in self.SCENARIOS)
+            for r in self.RENEWABLES
+        })
+
     def _build_mappings(self):
         m = build_connection_matrices(
-            self.NODES, self.GENERATORS, self.LOADS, self.ZONES,
+            self.NODES, self.GENERATORS, self.LOADS, self.ZONES,self.RENEWABLES,
             self.connections_per_node, self.generators_per_node,
-            self.loads_per_node, self.nodes_per_zone)
+            self.loads_per_node, self.nodes_per_zone,
+            self.renewables_per_node)
         self.mats = m
 
         # index lookups (handy for building numpy / solver variables)
@@ -281,25 +321,29 @@ class PowerSystemData:
         self.load_idx = {d: i for i, d in enumerate(self.LOADS)}
         self.zone_idx = {z: i for i, z in enumerate(self.ZONES)}
         self.scenario_idx = {s: i for i, s in enumerate(self.SCENARIOS)}
+        self.res_idx = {r: i for i, r in enumerate(self.RENEWABLES)}
 
         self.node_zone = m['node_zone']                      # node -> zone
 
         # arrays
         self.A_nn, self.M_ng, self.M_nd = m['A_nn'], m['M_ng'], m['M_nd']
         self.M_zn, self.M_zg, self.M_zd = m['M_zn'], m['M_zg'], m['M_zd']
+        self.M_nr, self.M_zr = m['M_nr'], m['M_zr']
         self.A_zz, self.B_nl, self.B_zl = m['A_zz'], m['B_nl'], m['B_zl']
 
         # nested-dict versions
-        N, G, D, Z = self.NODES, self.GENERATORS, self.LOADS, self.ZONES
+        N, G, D, Z, R = self.NODES, self.GENERATORS, self.LOADS, self.ZONES, self.RENEWABLES
         self.lines = m['lines']
         self.intra_lines = m['intra_lines']
         self.inter_lines = m['inter_lines']
         self.mapping_buses = _to_dict(self.A_nn, N, N)
         self.mapping_generators = _to_dict(self.M_ng, N, G)
         self.mapping_loads = _to_dict(self.M_nd, N, D)
+        self.mapping_renewables = _to_dict(self.M_nr, N, R)
         self.mapping_zones = _to_dict(self.M_zn, Z, N)
         self.mapping_zone_generators = _to_dict(self.M_zg, Z, G)
         self.mapping_zone_loads = _to_dict(self.M_zd, Z, D)
+        self.mapping_zone_renewables = _to_dict(self.M_zr, Z, R)
         self.mapping_zone_zone = _to_dict(self.A_zz, Z, Z)
 
         # connection lists (kept for backwards compatibility)
@@ -316,6 +360,7 @@ class PowerSystemData:
                            for z, ns in self.nodes_per_zone.items()}
         self.node_of_generator = {g: n for n, gs in self.generators_per_node.items() for g in gs}
         self.node_of_load = {d: n for n, ds in self.loads_per_node.items() for d in ds}
+        self.node_of_renewable = {r: n for n, rs in self.renewables_per_node.items() for r in rs}
 
     def _build_network(self):
         # per-line capacity and susceptance (ordered like self.lines)
@@ -359,7 +404,7 @@ class PowerSystemData:
         self.ptdf_zonal = _to_dict(self.PTDF_zonal, self.lines, self.ZONES)
 
     def _build_vectors(self):
-        G, D, S = self.GENERATORS, self.LOADS, self.SCENARIOS
+        G, D, S, R = self.GENERATORS, self.LOADS, self.SCENARIOS,self.RENEWABLES
         self.gen_cost_vec = np.array([self.gen_linear_cost_coeff[g] for g in G], float)
         self.gen_up_cost_vec = np.array([self.gen_up_deviation_cost_coeff[g] for g in G], float)
         self.gen_down_cost_vec = np.array([self.gen_down_deviation_cost_coeff[g] for g in G], float)
@@ -371,6 +416,12 @@ class PowerSystemData:
         self.scenario_prob_vec = np.array([self.scenario_probability[s] for s in S], float)
         self.load_scenarios_mat = np.array(
             [[self.load_scenarios[d][s] for s in S] for d in D], float)
+        self.res_max_vec = np.array([self.res_max_capacity[r] for r in R], float)
+        self.res_cost_vec = np.array([self.res_cost_coeff[r] for r in R], float)
+        self.res_curtailment_cost_vec = np.array([self.res_curtailment_cost[r] for r in R], float)
+        self.expected_DA_res_vec = np.array([self.expected_DA_res[r] for r in R], float)
+        self.res_scenarios_mat = np.array(
+            [[self.res_scenarios[r][s] for s in S] for r in R], float)
 
     def validate(self):
         assert len(self.GENERATORS) == len(self.gen_max_capacity), "generator data / set size mismatch"
@@ -384,6 +435,11 @@ class PowerSystemData:
             assert g in self.node_of_generator, f"generator {g} is not placed at any node"
         for d in self.LOADS:
             assert d in self.node_of_load, f"load {d} is not placed at any node"
+        for r in self.RENEWABLES:
+            assert r in self.node_of_renewable, f"renewable {r} is not placed at any node"
+            for s in self.SCENARIOS:
+                assert 0 <= self.res_scenarios[r][s] <= self.res_max_capacity[r], \
+                    f"renewable {r} in scenario {s} exceeds installed capacity"
         # B_bus from the incidence matrix must equal the Laplacian built from line data
         assert np.allclose(self.B_bus.sum(axis=1), 0), "B_bus rows must sum to zero"
         assert np.allclose(self.GSK.sum(axis=0), 1.0), "GSK columns must sum to 1"
@@ -394,6 +450,7 @@ class PowerSystemData:
         print(f"Zones      : {self.nodes_per_zone}")
         print(f"Generators : {self.generators_per_node}")
         print(f"Loads      : {self.loads_per_node}")
+        print(f"Renewables : {self.renewables_per_node}")
         print(f"Lines      : {self.lines}")
         print(f"  intra    : {self.intra_lines}")
         print(f"  inter    : {self.inter_lines}")
