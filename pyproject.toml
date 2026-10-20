@@ -3,7 +3,7 @@ name = "Torine-env"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.15"
 dependencies = [
     "gurobipy>=13.0.2",
     "ipykernel>=7.3.0",

@@ -408,5 +408,5 @@ class PowerSystemData:
 
 # =============================================================================
 if __name__ == "__main__":
-    data = PowerSystemData(slack_bus='N4')
+    data = PowerSystemData()#slack_bus='N4')
     data.summary()
