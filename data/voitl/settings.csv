@@ -1,0 +1,5 @@
+key,value
+slack_bus,N3
+S_BASE_MVA,100.0
+time_step,1
+gsk_method,generation

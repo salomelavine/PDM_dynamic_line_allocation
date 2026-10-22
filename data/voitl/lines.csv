@@ -1,0 +1,5 @@
+from,to,capacity,susceptance
+N1,N2,100,2.5
+N2,N3,30.0,2.5
+N1,N4,100.0,2.5
+N3,N4,100.0,2.5
